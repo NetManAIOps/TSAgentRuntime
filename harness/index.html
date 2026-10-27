@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GymTS Agent 试用</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1020;--panel:#121a2d;--line:#263453;--text:#edf3ff;--muted:#91a0bd;--accent:#6d8cff;--accent2:#8b6dff}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 20% 0,#18234b 0,transparent 42%),var(--bg);font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;color:var(--text)}
+main{width:min(900px,94vw);margin:36px auto}header{margin-bottom:22px}h1{font-size:28px;margin:0 0 6px}p{margin:4px 0;color:var(--muted)}.badge{display:inline-block;padding:2px 9px;border:1px solid #3b4f7b;border-radius:999px;color:#b9c8ff;font-size:12px;margin-bottom:10px}
+.panel{background:rgba(18,26,45,.94);border:1px solid var(--line);border-radius:16px;padding:20px;box-shadow:0 20px 60px #0005}textarea{width:100%;min-height:130px;resize:vertical;border:1px solid var(--line);border-radius:10px;background:#0b1222;color:var(--text);padding:14px;font:inherit;outline:none}textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px #6d8cff20}
+.row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px}.examples{display:flex;flex-wrap:wrap;gap:7px}.example{cursor:pointer;border:1px solid var(--line);border-radius:8px;background:#17213a;color:#b9c6e2;padding:5px 9px;font-size:12px}.example:hover{border-color:var(--accent);color:white}#send{cursor:pointer;border:0;border-radius:10px;padding:10px 22px;color:white;font-weight:600;background:linear-gradient(135deg,var(--accent),var(--accent2));white-space:nowrap}#send:disabled{opacity:.5;cursor:wait}
+#status{min-height:25px;margin-top:12px;color:var(--muted)}#answer{white-space:pre-wrap;overflow-wrap:anywhere;margin-top:12px;padding:16px;border-radius:10px;background:#0b1222;border:1px solid var(--line);display:none}#tools{display:none;margin-top:10px;color:#aebbd6;font-size:13px}.tool{display:inline-block;margin:3px 5px 0 0;padding:2px 8px;border-radius:6px;background:#16213a}footer{text-align:center;margin-top:16px;font-size:12px;color:#6f7f9e}
+@media(max-width:650px){main{margin:18px auto}.row{align-items:stretch;flex-direction:column}#send{padding:11px}.panel{padding:15px}}
+</style>
+</head>
+<body><main>
+<header><span class="badge">AgentRuntime · GymTS · LibraryTS</span><h1>GymTS Agent 试用</h1><p>普通问题直接回答；时序任务由模型自主调用十个真实 LibraryTS 工具。</p></header>
+<section class="panel">
+<label for="question">输入你的问题</label>
+<textarea id="question" autofocus placeholder="例如：请加载 lynx 数据集，用 naive drift 预测未来 3 步"></textarea>
+<div class="row"><div class="examples">
+<button class="example" data-q="你好，请介绍你能完成哪些任务。">能力介绍</button>
+<button class="example" data-q="请加载 lynx 数据集，用 naive drift 预测未来 3 步，返回三个预测值。">动态预测</button>
+<button class="example" data-q="检测序列 [0,0,5,6,0] 中大于 3 的异常点，使用阈值工具。">异常检测</button>
+<button class="example" data-q="计算序列 [1,2,3] 和 [1,2,5] 的欧氏距离。">距离计算</button>
+</div><button id="send">发送</button></div>
+<div id="status"></div><div id="answer"></div><div id="tools"></div>
+</section><footer>每次请求独立执行 · 结果由真实模型与 LibraryTS 工具生成</footer>
+</main>
+<script>
+const question=document.querySelector('#question'),send=document.querySelector('#send'),status=document.querySelector('#status'),answer=document.querySelector('#answer'),tools=document.querySelector('#tools');
+document.querySelectorAll('.example').forEach(button=>button.onclick=()=>{question.value=button.dataset.q;question.focus()});
+async function submit(){const text=question.value.trim();if(!text||send.disabled)return;send.disabled=true;send.textContent='执行中…';status.textContent='模型正在推理，工具任务可能需要 1–2 分钟，请稍候。';answer.style.display='none';tools.style.display='none';
+try{const response=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text})});const data=await response.json();if(!response.ok||data.status!=='ok')throw new Error(data.error||data.reply||`HTTP ${response.status}`);answer.textContent=data.reply;answer.style.display='block';status.textContent='完成';if(data.tool_calls&&data.tool_calls.length){tools.innerHTML='工具调用：'+data.tool_calls.map(call=>`<span class="tool">${call.tool} · ${call.status}</span>`).join('');tools.style.display='block'}else{tools.textContent='本次为模型直接回答，未调用工具。';tools.style.display='block'}}catch(error){status.textContent='请求失败';answer.textContent=String(error.message||error);answer.style.display='block'}finally{send.disabled=false;send.textContent='发送'}}
+send.onclick=submit;question.addEventListener('keydown',event=>{if((event.ctrlKey||event.metaKey)&&event.key==='Enter')submit()});
+</script></body></html>
