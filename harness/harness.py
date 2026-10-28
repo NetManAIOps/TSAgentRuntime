@@ -10,24 +10,41 @@ HTTP endpoints (AgentRuntime container contract):
   POST /compatible-mode/v1/responses -> Responses API JSON or SSE stream
   POST /chat                    -> {"message": str} -> {"reply": result}
 
-Every model exchange and tool call is journaled to JSONL; LibraryTSTools
-persists each native call as CAS evidence.
+Every model exchange and tool call is journaled to JSONL and exported as
+OpenTelemetry GenAI spans; LibraryTSTools persists each native call as CAS evidence.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from gymts import GymTS
 from gymts_libraryts.tools import LibraryTSTools
+from opentelemetry.util.genai.extended_handler import get_extended_telemetry_handler
+from opentelemetry.util.genai.extended_types import (
+    EntryInvocation,
+    ExecuteToolInvocation,
+    InvokeAgentInvocation,
+    ReactStepInvocation,
+)
+from opentelemetry.util.genai.types import (
+    FunctionToolDefinition,
+    InputMessage,
+    LLMInvocation,
+    OutputMessage,
+    Text,
+    ToolCall,
+    ToolCallResponse,
+)
 
 API_BASE = os.environ.get("LLM_BASE_URL", "https://kuaipao.pro/v1")
 API_KEY = os.environ.get("LLM_API_KEY", "")
@@ -163,6 +180,47 @@ def tool_feedback(output):
     return output
 
 
+def telemetry_messages(messages: list[dict]) -> list[InputMessage]:
+    traced = []
+    for message in messages:
+        role = message.get("role", "user")
+        if role == "system":
+            continue
+        parts = []
+        if message.get("content"):
+            parts.append(Text(content=message["content"]))
+        for native_call in message.get("tool_calls") or []:
+            function = native_call.get("function") or {}
+            parts.append(ToolCall(
+                name=function.get("name", ""),
+                arguments=function.get("arguments", ""),
+                id=native_call.get("id"),
+            ))
+        if role == "tool":
+            parts.append(ToolCallResponse(
+                response=message.get("content", ""),
+                id=message.get("tool_call_id"),
+            ))
+        traced.append(InputMessage(role=role, parts=parts))
+    return traced
+
+
+def telemetry_output(message: dict, finish_reason: str) -> OutputMessage:
+    parts = []
+    if message.get("content"):
+        parts.append(Text(content=message["content"]))
+    if message.get("reasoning_content"):
+        parts.append(Text(content=message["reasoning_content"]))
+    for native_call in message.get("tool_calls") or []:
+        function = native_call.get("function") or {}
+        parts.append(ToolCall(
+            name=function.get("name", ""),
+            arguments=function.get("arguments", ""),
+            id=native_call.get("id"),
+        ))
+    return OutputMessage(role="assistant", parts=parts, finish_reason=finish_reason)
+
+
 def run_task(task: str, journal_path: Path = JOURNAL) -> dict:
     journal_path.parent.mkdir(parents=True, exist_ok=True)
     implementation = {
@@ -171,64 +229,146 @@ def run_task(task: str, journal_path: Path = JOURNAL) -> dict:
         "python": sys.executable,
     }
     calls = []
-    with journal_path.open("a", buffering=1) as journal:
-        with GymTS(GYM_STORE, integrations=("libraryts",)) as gym:
-            tools = LibraryTSTools(gym.artifacts, implementation)
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": task},
-            ]
-            for round_no in range(1, 17):
-                started = time.time()
-                resp = chat(messages)
-                msg = resp["choices"][0]["message"]
-                content = (msg.get("content") or "").strip()
-                native_calls = msg.get("tool_calls") or []
-                journal.write(json.dumps({
-                    "round": round_no, "model": MODEL, "response_content": content,
-                    "tool_calls": native_calls, "reasoning_content": msg.get("reasoning_content"),
-                    "usage": resp.get("usage"), "seconds": round(time.time() - started, 2),
-                }, ensure_ascii=False) + "\n")
-                if not native_calls:
-                    if not content:
-                        return {"status": "error", "error": "model returned an empty response",
-                                "journal": str(journal_path)}
-                    return {"status": "ok", "reply": content, "tool_calls": calls,
-                            "journal": str(journal_path)}
+    task_result = {"status": "error", "error": "model did not finish in 16 rounds",
+                   "tool_calls": calls, "journal": str(journal_path)}
+    handler = get_extended_telemetry_handler()
+    endpoint = urllib.parse.urlsplit(API_BASE)
+    entry = EntryInvocation(
+        session_id=str(uuid.uuid4()),
+        user_id="anonymous",
+        input_messages=[InputMessage(role="user", parts=[Text(content=task)])],
+    )
+    agent = InvokeAgentInvocation(
+        provider="deepseek",
+        agent_name="GymTS LibraryTS Harness Agent",
+        agent_description="Conversational time-series agent with ten LibraryTS tools",
+        request_model=MODEL,
+        conversation_id=entry.session_id,
+        input_messages=entry.input_messages,
+        system_instruction=[Text(content=SYSTEM_PROMPT)],
+        tool_definitions=[
+            FunctionToolDefinition(
+                name=item["function"]["name"],
+                description=item["function"]["description"],
+                parameters=item["function"]["parameters"],
+            )
+            for item in OPENAI_TOOLS
+        ],
+        server_address=endpoint.hostname,
+        server_port=endpoint.port,
+    )
+    with handler.entry(entry):
+        with handler.invoke_agent(agent):
+            total_input_tokens = 0
+            total_output_tokens = 0
+            with journal_path.open("a", buffering=1) as journal:
+                with GymTS(GYM_STORE, integrations=("libraryts",)) as gym:
+                    tools = LibraryTSTools(gym.artifacts, implementation)
+                    messages = [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": task},
+                    ]
+                    for round_no in range(1, 17):
+                        step = ReactStepInvocation(round=round_no)
+                        with handler.react_step(step):
+                            started = time.time()
+                            llm = LLMInvocation(
+                                provider="deepseek",
+                                request_model=MODEL,
+                                input_messages=telemetry_messages(messages),
+                                system_instruction=[Text(content=SYSTEM_PROMPT)],
+                                tool_definitions=agent.tool_definitions,
+                                conversation_id=entry.session_id,
+                                temperature=0.2,
+                                max_tokens=8000,
+                                server_address=endpoint.hostname,
+                                server_port=endpoint.port,
+                            )
+                            with handler.llm(llm):
+                                resp = chat(messages)
+                                choice = resp["choices"][0]
+                                msg = choice["message"]
+                                content = (msg.get("content") or "").strip()
+                                native_calls = msg.get("tool_calls") or []
+                                usage = resp.get("usage") or {}
+                                input_tokens = usage.get("prompt_tokens") or 0
+                                output_tokens = usage.get("completion_tokens") or 0
+                                total_input_tokens += input_tokens
+                                total_output_tokens += output_tokens
+                                llm.response_id = resp.get("id")
+                                llm.response_model_name = resp.get("model") or MODEL
+                                llm.finish_reasons = [choice.get("finish_reason") or "stop"]
+                                llm.input_tokens = input_tokens
+                                llm.output_tokens = output_tokens
+                                llm.output_messages = [telemetry_output(
+                                    msg, choice.get("finish_reason") or "stop",
+                                )]
+                            journal.write(json.dumps({
+                                "round": round_no, "model": MODEL, "response_content": content,
+                                "tool_calls": native_calls, "reasoning_content": msg.get("reasoning_content"),
+                                "usage": resp.get("usage"), "seconds": round(time.time() - started, 2),
+                            }, ensure_ascii=False) + "\n")
+                            if not native_calls:
+                                step.finish_reason = "stop"
+                                if not content:
+                                    task_result = {"status": "error", "error": "model returned an empty response",
+                                                   "journal": str(journal_path)}
+                                else:
+                                    task_result = {"status": "ok", "reply": content, "tool_calls": calls,
+                                                   "journal": str(journal_path)}
+                                break
 
-                assistant = {"role": "assistant", "content": msg.get("content"),
-                             "tool_calls": native_calls}
-                messages.append(assistant)
-                for native_call in native_calls:
-                    function = native_call.get("function") or {}
-                    tool = FUNCTION_TO_TOOL.get(function.get("name"))
-                    call_id = native_call.get("id") or f"call_{round_no}_{len(calls)}"
-                    try:
-                        payload = json.loads(function.get("arguments") or "{}")
-                        if not isinstance(payload, dict):
-                            raise ValueError("tool arguments must be a JSON object")
-                        if tool is None:
-                            raise ValueError("unknown tool")
-                        arguments = payload.get("arguments") or {}
-                        params = payload.get("params") or {}
-                        if not isinstance(arguments, dict) or not isinstance(params, dict):
-                            raise ValueError("arguments and params must be JSON objects")
-                        call = tools.call(tool, arguments, params, parent_call_id=call_id)
-                        result = {"status": "succeeded", "output": tool_feedback(call["output"])}
-                        calls.append({"tool": tool, "call_id": call_id, "status": "succeeded",
-                                      "call_ref": call["call_ref"]})
-                    except Exception as exc:
-                        result = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"[:1000]}
-                        calls.append({"tool": tool or function.get("name"), "call_id": call_id,
-                                      "status": "failed"})
-                    journal.write(json.dumps({
-                        "round": round_no, "call_id": call_id, "tool": tool,
-                        "arguments": function.get("arguments"), "result": result,
-                    }, ensure_ascii=False, default=str) + "\n")
-                    messages.append({"role": "tool", "tool_call_id": call_id,
-                                     "content": json.dumps(result, ensure_ascii=False)})
-    return {"status": "error", "error": "model did not finish in 16 rounds",
-            "tool_calls": calls, "journal": str(journal_path)}
+                            step.finish_reason = "continue"
+                            assistant = {"role": "assistant", "content": msg.get("content"),
+                                         "tool_calls": native_calls}
+                            messages.append(assistant)
+                            for native_call in native_calls:
+                                function = native_call.get("function") or {}
+                                tool = FUNCTION_TO_TOOL.get(function.get("name"))
+                                call_id = native_call.get("id") or f"call_{round_no}_{len(calls)}"
+                                tool_invocation = ExecuteToolInvocation(
+                                    tool_name=tool or function.get("name") or "unknown",
+                                    tool_call_id=call_id,
+                                    tool_call_arguments=function.get("arguments") or "{}",
+                                    tool_type="function",
+                                )
+                                try:
+                                    with handler.execute_tool(tool_invocation):
+                                        payload = json.loads(function.get("arguments") or "{}")
+                                        if not isinstance(payload, dict):
+                                            raise ValueError("tool arguments must be a JSON object")
+                                        if tool is None:
+                                            raise ValueError("unknown tool")
+                                        arguments = payload.get("arguments") or {}
+                                        params = payload.get("params") or {}
+                                        if not isinstance(arguments, dict) or not isinstance(params, dict):
+                                            raise ValueError("arguments and params must be JSON objects")
+                                        call = tools.call(tool, arguments, params, parent_call_id=call_id)
+                                        tool_result = {"status": "succeeded", "output": tool_feedback(call["output"])}
+                                        tool_invocation.tool_call_result = tool_result
+                                        calls.append({"tool": tool, "call_id": call_id, "status": "succeeded",
+                                                      "call_ref": call["call_ref"]})
+                                except Exception as exc:
+                                    tool_result = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"[:1000]}
+                                    calls.append({"tool": tool or function.get("name"), "call_id": call_id,
+                                                  "status": "failed"})
+                                journal.write(json.dumps({
+                                    "round": round_no, "call_id": call_id, "tool": tool,
+                                    "arguments": function.get("arguments"), "result": tool_result,
+                                }, ensure_ascii=False, default=str) + "\n")
+                                messages.append({"role": "tool", "tool_call_id": call_id,
+                                                 "content": json.dumps(tool_result, ensure_ascii=False)})
+            agent.input_tokens = total_input_tokens
+            agent.output_tokens = total_output_tokens
+            output = task_result.get("reply") or task_result.get("error") or "Agent task failed"
+            finish_reason = "stop" if task_result["status"] == "ok" else "error"
+            agent.finish_reasons = [finish_reason]
+            agent.output_messages = [OutputMessage(
+                role="assistant", parts=[Text(content=output)], finish_reason=finish_reason,
+            )]
+            entry.output_messages = agent.output_messages
+    task_result["trace_id"] = f"{entry.span.get_span_context().trace_id:032x}"
+    return task_result
 
 
 def responses_input(request: dict) -> str:
